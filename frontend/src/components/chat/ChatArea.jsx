@@ -42,6 +42,7 @@ function CompactVoiceCompanion({
     errorMessage,
     startListening,
     stopListening,
+    submitSpeech,
     interrupt,
     toggleMute,
   } = useVoiceSession({
@@ -67,7 +68,7 @@ function CompactVoiceCompanion({
       }
       onToggleMute={toggleMute}
       onStartListening={startListening}
-      onStopListening={stopListening}
+      onSubmitSpeech={submitSpeech}
       onInterrupt={interrupt}
       onClose={onClose}
     />

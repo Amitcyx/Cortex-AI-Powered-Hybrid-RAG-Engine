@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from "react";
-import { Mic, MicOff, X, Sparkles, AlertCircle } from "lucide-react";
+import { Mic, MicOff, X, Sparkles } from "lucide-react";
 import CompactVoiceOrb from "./CompactVoiceOrb";
 
 /**
@@ -12,7 +12,7 @@ import CompactVoiceOrb from "./CompactVoiceOrb";
  * - Closes on Escape.
  */
 export default function CompactVoiceBar({
-  phase = "listening", // "listening" | "thinking" | "speaking" | "idle" | "error"
+  phase = "listening", // "listening" | "thinking" | "speaking" | "idle" | "error" | "muted"
   audioLevel = 0,
   isMuted = false,
   userTranscript = "",
@@ -21,7 +21,7 @@ export default function CompactVoiceBar({
   personaLabel = "Default",
   onToggleMute,
   onStartListening,
-  onStopListening,
+  onSubmitSpeech,
   onInterrupt,
   onClose,
 }) {
@@ -31,13 +31,14 @@ export default function CompactVoiceBar({
     if (currentPhase === "speaking") {
       onInterrupt?.();
     } else if (currentPhase === "listening") {
-      onStopListening?.();
+      // Tapping while listening immediately submits speech (or user can pause to auto-submit via VAD)
+      onSubmitSpeech?.();
     } else if (currentPhase === "muted") {
       onToggleMute?.();
     } else {
       onStartListening?.();
     }
-  }, [currentPhase, onInterrupt, onStopListening, onToggleMute, onStartListening]);
+  }, [currentPhase, onInterrupt, onSubmitSpeech, onToggleMute, onStartListening]);
 
   // Keyboard shortcut listener (Escape to close, Space to talk/interrupt)
   useEffect(() => {
@@ -62,19 +63,19 @@ export default function CompactVoiceBar({
   // Determine concise status copy matching PRD Section 9
   const getStatusText = () => {
     if (errorMessage) {
-      return errorMessage.length > 50 ? `${errorMessage.slice(0, 50)}...` : errorMessage;
+      return errorMessage.length > 55 ? `${errorMessage.slice(0, 55)}...` : errorMessage;
     }
     switch (currentPhase) {
       case "listening":
-        return "Listening";
+        return "Listening (speak or tap to send)";
       case "thinking":
         return "Thinking…";
       case "speaking":
-        return "Speaking";
+        return "Speaking (tap to interrupt)";
       case "muted":
         return "Microphone off";
       default:
-        return "Tap to speak";
+        return "Tap orb to speak";
     }
   };
 

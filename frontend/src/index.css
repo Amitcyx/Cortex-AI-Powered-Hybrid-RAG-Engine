@@ -2424,9 +2424,9 @@ body,
 /* In-Chat Compact Voice Container (Anchored above Composer) */
 .chat-compact-voice-container {
   width: 100%;
-  max-width: 860px;
+  max-width: 820px;
   margin: 0 auto;
-  padding: 0 16px 8px 16px;
+  padding: 0 20px 8px 20px;
   position: relative;
   z-index: 20;
   animation: compactVoiceSlideIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;

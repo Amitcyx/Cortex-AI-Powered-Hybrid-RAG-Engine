@@ -127,9 +127,10 @@ export default function App() {
 
   // Voice Mode Start & Stop Handlers
   const handleOpenVoiceMode = useCallback(() => {
+    const currentId = activeSessionId || createNewChat();
+    setActiveVoiceSessionId(currentId);
     setIsVoiceActive(true);
-    setActiveVoiceSessionId(activeSessionId);
-  }, [activeSessionId]);
+  }, [activeSessionId, createNewChat]);
 
   const handleCloseVoiceMode = useCallback(() => {
     setIsVoiceActive(false);
