@@ -408,6 +408,63 @@ body,
   border-top: 1px solid var(--border-subtle);
 }
 
+.sidebar-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+
+.sidebar-footer-row.collapsed {
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-footer-row .user-profile-wrapper {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-footer-settings-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+
+.sidebar-footer-settings-btn:hover {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border-color: var(--border-subtle);
+}
+
+.sidebar-footer-settings-btn:active {
+  transform: scale(0.95);
+}
+
+.sidebar-footer-settings-btn.collapsed {
+  width: 36px;
+  height: 36px;
+}
+
+.sidebar-footer-settings-icon {
+  color: #94a3b8;
+  transition: color var(--transition), transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.sidebar-footer-settings-btn:hover .sidebar-footer-settings-icon {
+  color: #f8fafc;
+  transform: rotate(45deg);
+}
+
 .user-profile-wrapper {
   position: relative;
   width: 100%;

@@ -147,35 +147,25 @@ export default function Sidebar({
           </button>
         </div>
 
-        {/* Settings Action: Voice & Preferences (PRD Section 10) */}
-        <div className="sidebar-settings-section">
-          <button
-            className={`sidebar-settings-btn ${!isOpen ? "collapsed" : ""}`}
-            onClick={onOpenSettings}
-            title="Settings (Voice & Preferences)"
-            aria-label="Settings"
-          >
-            <Settings size={17} className="shrink-0 text-slate-400" />
-            {isOpen && (
-              <div className="sidebar-action-label-row">
-                <span>Settings</span>
-                <span className="sidebar-voice-pill">
-                  <Volume2 size={11} className="inline mr-1" />
-                  {selectedVoice.charAt(0).toUpperCase() + selectedVoice.slice(1)}
-                </span>
-              </div>
-            )}
-          </button>
-        </div>
-
-        {/* Sidebar Footer: User Account */}
+        {/* Sidebar Footer: User Account & Settings side-by-side */}
         <div className="sidebar-footer">
-          <UserProfile
-            currentUser={currentUser}
-            onOpenAuth={onOpenAuth}
-            onLogout={onLogout}
-            isCollapsed={!isOpen}
-          />
+          <div className={`sidebar-footer-row ${!isOpen ? "collapsed" : ""}`}>
+            <UserProfile
+              currentUser={currentUser}
+              onOpenAuth={onOpenAuth}
+              onLogout={onLogout}
+              isCollapsed={!isOpen}
+            />
+
+            <button
+              className={`sidebar-footer-settings-btn ${!isOpen ? "collapsed" : ""}`}
+              onClick={onOpenSettings}
+              title={`Settings (Voice: ${selectedVoice.charAt(0).toUpperCase() + selectedVoice.slice(1)})`}
+              aria-label="Settings"
+            >
+              <Settings size={18} className="sidebar-footer-settings-icon shrink-0" />
+            </button>
+          </div>
         </div>
       </aside>
 
