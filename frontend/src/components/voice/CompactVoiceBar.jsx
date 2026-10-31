@@ -69,7 +69,7 @@ export default function CompactVoiceBar({
       case "listening":
         return "Listening (speak or tap to send)";
       case "thinking":
-        return "Thinking…";
+        return "Thinking...";
       case "speaking":
         return "Speaking (tap to interrupt)";
       case "muted":
@@ -117,7 +117,7 @@ export default function CompactVoiceBar({
         {/* Lightweight, secondary transcript line */}
         {displayTranscript && (
           <div className="compact-voice-transcript truncate" title={displayTranscript}>
-            “{displayTranscript}”
+            &ldquo;{displayTranscript}&rdquo;
           </div>
         )}
       </div>

@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { getVoiceWebSocketUrl } from "../api/voice";
+import { getVoiceWebSocketCandidates } from "../api/voice";
 
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -15,16 +15,16 @@ function blobToBase64(blob) {
 }
 
 /**
- * useVoiceSession - Robust, persistent voice companion session hook.
+ * useVoiceSession - Robust, persistent compact voice companion session hook.
  *
- * Key features:
- * - Persistent WebSocket connection bound to sessionId (no teardown on re-renders).
- * - Automatic reconnection if network or socket drops.
- * - Persistent microphone stream: avoids re-requesting mic permissions on each turn.
- * - Natural Voice Activity Detection (VAD): auto-submits upon 1.3s of pause after speaking.
- * - Immediate Tap-to-Send on the orb.
+ * Core capabilities:
+ * - Resilient WebSocket connection lifecycle with candidate failover (same-origin proxy -> direct 127.0.0.1:8000).
+ * - Automatic reconnection with exponential backoff on unexpected drops.
+ * - Persistent microphone stream to prevent repeated browser permission prompts.
+ * - Natural Voice Activity Detection (VAD) auto-submit on 1.3s speech pause.
+ * - Immediate Tap-to-Send / Tap-to-Interrupt on the orb.
  * - Full turn lifecycle: listening -> thinking -> speaking -> listening.
- * - Zero resource leaks on unmount.
+ * - Zero resource leaks or callback races across unmounts or chat switches.
  */
 export function useVoiceSession({
   userId,
@@ -62,11 +62,24 @@ export function useVoiceSession({
   const silenceTimerRef = useRef(null);
   const isSubmittingRef = useRef(false);
   const pendingAudioPayloadRef = useRef(null);
-  const reconnectTimeoutRef = useRef(null);
 
   const onAddMessageRef = useRef(onAddMessage);
   const userIdRef = useRef(userId);
   const sessionIdRef = useRef(sessionId);
+
+  // Forward refs for stable turn handlers
+  const startListeningRef = useRef(null);
+  const stopListeningRef = useRef(null);
+  const submitSpeechRef = useRef(null);
+  const stopPlaybackRef = useRef(null);
+  const enqueueAudioRef = useRef(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -85,7 +98,7 @@ export function useVoiceSession({
     isMutedRef.current = isMuted;
   }, [isMuted]);
 
-  // Update persona over active WebSocket
+  // Update persona over active WebSocket when user changes settings
   useEffect(() => {
     personaRef.current = persona;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -122,10 +135,7 @@ export function useVoiceSession({
     audioQueueRef.current = [];
     isPlayingRef.current = false;
   }, []);
-
-  // Forward refs for recursive turn functions
-  const startListeningRef = useRef(null);
-  const submitSpeechRef = useRef(null);
+  stopPlaybackRef.current = stopPlayback;
 
   // Play queued assistant audio chunks sequentially
   const playNextInQueue = useCallback(() => {
@@ -168,12 +178,16 @@ export function useVoiceSession({
     });
   }, []);
 
-  const enqueueAudio = useCallback((b64) => {
-    audioQueueRef.current.push(b64);
-    playNextInQueue();
-  }, [playNextInQueue]);
+  const enqueueAudio = useCallback(
+    (b64) => {
+      audioQueueRef.current.push(b64);
+      playNextInQueue();
+    },
+    [playNextInQueue]
+  );
+  enqueueAudioRef.current = enqueueAudio;
 
-  // Submit speech audio to backend
+  // Submit recorded user speech
   const submitSpeech = useCallback(() => {
     if (isSubmittingRef.current) return;
     if (silenceTimerRef.current) {
@@ -184,6 +198,7 @@ export function useVoiceSession({
     const recorder = recorderRef.current;
     if (!recorder || recorder.state === "inactive") return;
 
+    userHasSpokenRef.current = true;
     isSubmittingRef.current = true;
     setPhase("thinking");
 
@@ -197,7 +212,6 @@ export function useVoiceSession({
       setPhase("listening");
     }
   }, []);
-
   submitSpeechRef.current = submitSpeech;
 
   // Setup live audio analyser & VAD
@@ -219,7 +233,7 @@ export function useVoiceSession({
       const updateLevel = (timestamp) => {
         if (!analyserRef.current || !isMountedRef.current) return;
 
-        // Throttle to ~30 fps
+        // Throttle analyser updates to ~30 fps
         if (timestamp - lastAnalyserTimeRef.current >= 33) {
           lastAnalyserTimeRef.current = timestamp;
           analyserRef.current.getByteFrequencyData(dataArray);
@@ -264,7 +278,6 @@ export function useVoiceSession({
       wsRef.current.send(JSON.stringify(payload));
       return true;
     }
-    // Socket not ready; queue payload
     pendingAudioPayloadRef.current = payload;
     return false;
   };
@@ -278,7 +291,7 @@ export function useVoiceSession({
     isSubmittingRef.current = false;
 
     if (isPlayingRef.current) {
-      stopPlayback();
+      stopPlaybackRef.current?.();
     }
 
     if (silenceTimerRef.current) {
@@ -287,7 +300,9 @@ export function useVoiceSession({
     }
 
     if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      try { recorderRef.current.stop(); } catch {}
+      try {
+        recorderRef.current.stop();
+      } catch {}
     }
 
     try {
@@ -356,7 +371,6 @@ export function useVoiceSession({
             wsRef.current.send(JSON.stringify(audioMsg));
             wsRef.current.send(JSON.stringify(stopMsg));
           } else {
-            // Socket momentarily buffering/reconnecting
             sendVoicePayload(audioMsg);
             sendVoicePayload(stopMsg);
           }
@@ -375,23 +389,22 @@ export function useVoiceSession({
     } catch (err) {
       setErrorMessage(
         err.name === "NotAllowedError" || err.name === "PermissionDeniedError"
-          ? "Microphone access denied. Please click the lock/camera icon in your address bar to allow microphone."
+          ? "Microphone access denied. Please click the lock icon in your address bar to allow microphone."
           : `Microphone unavailable: ${err.message}`
       );
       setPhase("error");
     }
-  }, [stopPlayback]);
-
+  }, []);
   startListeningRef.current = startListening;
 
   // Interrupt assistant speech (barge-in)
   const interrupt = useCallback(() => {
-    stopPlayback();
+    stopPlaybackRef.current?.();
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "interrupt" }));
     }
-    startListening();
-  }, [stopPlayback, startListening]);
+    startListeningRef.current?.();
+  }, []);
 
   // Toggle Mute
   const toggleMute = useCallback(() => {
@@ -400,16 +413,18 @@ export function useVoiceSession({
       isMutedRef.current = next;
       if (next) {
         if (recorderRef.current && recorderRef.current.state !== "inactive") {
-          try { recorderRef.current.stop(); } catch {}
+          try {
+            recorderRef.current.stop();
+          } catch {}
         }
         stopAudioAnalyser();
         setPhase("muted");
       } else {
-        startListening();
+        startListeningRef.current?.();
       }
       return next;
     });
-  }, [startListening]);
+  }, []);
 
   // Stop listening completely (used on close/unmount)
   const stopListening = useCallback(() => {
@@ -421,7 +436,9 @@ export function useVoiceSession({
     isSubmittingRef.current = false;
 
     if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      try { recorderRef.current.stop(); } catch {}
+      try {
+        recorderRef.current.stop();
+      } catch {}
     }
     recorderRef.current = null;
     stopAudioAnalyser();
@@ -431,22 +448,43 @@ export function useVoiceSession({
       streamRef.current = null;
     }
   }, []);
+  stopListeningRef.current = stopListening;
 
-  // Persistent WebSocket connection manager
+  // Persistent, failover-safe WebSocket connection manager
   useEffect(() => {
-    isMountedRef.current = true;
+    let isCurrent = true;
     let ws = null;
+    let reconnectTimer = null;
+    let candidateIndex = 0;
+    let retryCount = 0;
+    let isIntentionalClose = false;
+
+    const candidates = getVoiceWebSocketCandidates();
 
     const connect = () => {
-      if (!isMountedRef.current) return;
+      if (!isCurrent || isIntentionalClose) return;
+
+      // Clean up any stale socket on this instance before opening next
+      if (ws) {
+        try {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          ws.close(1000, "Switching candidates");
+        } catch {}
+        ws = null;
+      }
+
+      const wsUrl = candidates[candidateIndex % candidates.length];
 
       try {
-        const wsUrl = getVoiceWebSocketUrl();
         ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
-          if (!isMountedRef.current) return;
+          if (!isCurrent || isIntentionalClose) return;
+          retryCount = 0;
           setErrorMessage("");
 
           // Send handshake
@@ -471,13 +509,14 @@ export function useVoiceSession({
         };
 
         ws.onmessage = (e) => {
-          if (!isMountedRef.current) return;
+          if (!isCurrent || isIntentionalClose) return;
           try {
             const msg = JSON.parse(e.data);
             switch (msg.type) {
               case "ready":
+                setErrorMessage("");
                 if (!isPlayingRef.current && phaseRef.current !== "speaking") {
-                  setPhase((prev) => (prev === "error" ? prev : "listening"));
+                  setPhase("listening");
                 }
                 break;
 
@@ -486,7 +525,6 @@ export function useVoiceSession({
                   setUserTranscript(msg.text);
                   onAddMessageRef.current?.({ role: "user", content: msg.text, voiceMsg: true });
                 } else {
-                  // Empty transcript (background noise): return to listening
                   setPhase("listening");
                   startListeningRef.current?.();
                 }
@@ -500,7 +538,7 @@ export function useVoiceSession({
 
               case "assistant_audio":
                 if (msg.b64 && !isMutedRef.current) {
-                  enqueueAudio(msg.b64);
+                  enqueueAudioRef.current?.(msg.b64);
                 }
                 break;
 
@@ -512,7 +550,7 @@ export function useVoiceSession({
                 break;
 
               case "interrupted":
-                stopPlayback();
+                stopPlaybackRef.current?.();
                 startListeningRef.current?.();
                 break;
 
@@ -525,23 +563,35 @@ export function useVoiceSession({
         };
 
         ws.onerror = () => {
-          if (!isMountedRef.current) return;
-          setErrorMessage("Voice connection error. Reconnecting...");
+          if (!isCurrent || isIntentionalClose) return;
+          // Advance candidate to next endpoint in case of host/proxy refusal
+          candidateIndex++;
         };
 
-        ws.onclose = () => {
-          if (!isMountedRef.current) return;
-          // Auto-reconnect with 1.5s delay if still mounted
-          reconnectTimeoutRef.current = setTimeout(() => {
-            if (isMountedRef.current) {
+        ws.onclose = (event) => {
+          if (!isCurrent || isIntentionalClose || event.code === 1000) return;
+
+          const delay = Math.min(1000 * Math.pow(1.5, retryCount), 5000);
+          retryCount++;
+
+          if (retryCount > 1) {
+            setErrorMessage("Connecting to voice service...");
+          }
+
+          reconnectTimer = setTimeout(() => {
+            if (isCurrent && !isIntentionalClose) {
+              connect();
+            }
+          }, delay);
+        };
+      } catch (err) {
+        if (isCurrent && !isIntentionalClose) {
+          candidateIndex++;
+          reconnectTimer = setTimeout(() => {
+            if (isCurrent && !isIntentionalClose) {
               connect();
             }
           }, 1500);
-        };
-      } catch (err) {
-        if (isMountedRef.current) {
-          setErrorMessage(err.message || "WebSocket failed");
-          setPhase("error");
         }
       }
     };
@@ -549,21 +599,31 @@ export function useVoiceSession({
     connect();
 
     return () => {
-      isMountedRef.current = false;
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-      stopPlayback();
-      stopListening();
+      isCurrent = false;
+      isIntentionalClose = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+
+      stopPlaybackRef.current?.();
+      stopListeningRef.current?.();
       stopAudioAnalyser();
 
       if (ws) {
-        try { ws.send(JSON.stringify({ type: "end" })); } catch {}
-        try { ws.close(); } catch {}
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try {
+          ws.send(JSON.stringify({ type: "end" }));
+        } catch {}
+        try {
+          ws.close(1000, "Session ended");
+        } catch {}
       }
-      wsRef.current = null;
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
     };
-  }, [sessionId, autoStart, enqueueAudio, stopListening, stopPlayback]);
+  }, [sessionId, autoStart]);
 
   return {
     phase: isMuted ? "muted" : phase,
