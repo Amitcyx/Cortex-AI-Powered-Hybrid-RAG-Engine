@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { getVoiceWebSocketUrl, fetchIntroAudioBlob } from "../api/voice";
+import { getVoiceWebSocketUrl } from "../api/voice";
 
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -14,16 +14,32 @@ function blobToBase64(blob) {
   });
 }
 
-export function useVoiceSession({ userId, sessionId, persona = "default", onAddMessage }) {
-  const [phase, setPhase] = useState("idle"); // "idle" | "listening" | "thinking" | "speaking"
+/**
+ * useVoiceSession - Manages active WebSocket connection, microphone capture,
+ * audio playback, and state transitions for Cortex Compact Voice Mode.
+ *
+ * Implements PRD Section 14 lifecycle:
+ * inactive -> listening -> processing/thinking -> speaking -> listening
+ *
+ * Ensures full cleanup on unmount or chat switch (stops mic tracks, closes WS, releases AudioContext).
+ */
+export function useVoiceSession({
+  userId,
+  sessionId,
+  persona = "default",
+  autoStart = true,
+  onAddMessage,
+}) {
+  const [phase, setPhase] = useState("listening"); // "idle" | "listening" | "thinking" | "speaking" | "error"
   const [isMuted, setIsMuted] = useState(false);
   const [userTranscript, setUserTranscript] = useState("");
   const [assistantText, setAssistantText] = useState("");
-  const [voiceHistory, setVoiceHistory] = useState([]); // [{ role, content }]
+  const [voiceHistory, setVoiceHistory] = useState([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [audioLevel, setAudioLevel] = useState(0);
 
   const wsRef = useRef(null);
+  const streamRef = useRef(null);
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
   const audioQueueRef = useRef([]);
@@ -32,8 +48,10 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const animFrameRef = useRef(null);
+  const lastAnalyserTimeRef = useRef(0);
   const isMutedRef = useRef(false);
   const personaRef = useRef(persona);
+  const isListeningActiveRef = useRef(false);
 
   const onAddMessageRef = useRef(onAddMessage);
   const userIdRef = useRef(userId);
@@ -59,7 +77,7 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
     }
   }, [persona]);
 
-  // Audio level analyser for waveform
+  // Audio level analyser with 30fps throttling for low CPU load on integrated graphics
   const setupAudioAnalyser = (stream) => {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -71,21 +89,30 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
       analyserRef.current = analyser;
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const updateLevel = () => {
+      const updateLevel = (timestamp) => {
         if (!analyserRef.current) return;
-        analyserRef.current.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-        const avg = sum / dataArray.length;
-        setAudioLevel(Math.min(100, Math.round((avg / 128) * 100)));
+
+        // Throttle to ~30 fps (every 33ms)
+        if (timestamp - lastAnalyserTimeRef.current >= 33) {
+          lastAnalyserTimeRef.current = timestamp;
+          analyserRef.current.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+          const avg = sum / dataArray.length;
+          setAudioLevel(Math.min(100, Math.round((avg / 128) * 100)));
+        }
+
         animFrameRef.current = requestAnimationFrame(updateLevel);
       };
-      updateLevel();
+      animFrameRef.current = requestAnimationFrame(updateLevel);
     } catch {}
   };
 
   const stopAudioAnalyser = () => {
-    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -94,12 +121,34 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
     setAudioLevel(0);
   };
 
+  // Forward declarations for mutual recursion
+  const startListeningRef = useRef(null);
+
+  // Stop playback cleanly
+  const stopPlayback = useCallback(() => {
+    if (currentAudioRef.current) {
+      try {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      } catch {}
+    }
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+  }, []);
+
   // Play assistant audio queue
   const playNextInQueue = useCallback(() => {
     if (isPlayingRef.current) return;
     const nextB64 = audioQueueRef.current.shift();
+
     if (!nextB64) {
-      setPhase((prev) => (prev === "speaking" ? "idle" : prev));
+      // Audio queue finished! Return to listening state naturally (PRD lifecycle: speaking -> listening)
+      isPlayingRef.current = false;
+      if (!isMutedRef.current && startListeningRef.current) {
+        startListeningRef.current();
+      } else {
+        setPhase("idle");
+      }
       return;
     }
 
@@ -134,18 +183,134 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
     playNextInQueue();
   }, [playNextInQueue]);
 
-  const stopPlayback = useCallback(() => {
-    if (currentAudioRef.current) {
+  // Stop microphone recording
+  const stopListening = useCallback(() => {
+    isListeningActiveRef.current = false;
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
       try {
-        currentAudioRef.current.pause();
-        currentAudioRef.current = null;
+        recorderRef.current.stop();
       } catch {}
     }
-    audioQueueRef.current = [];
-    isPlayingRef.current = false;
+    recorderRef.current = null;
+    stopAudioAnalyser();
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
   }, []);
 
-  // WebSocket lifecycle (connect once when mounted or when sessionId changes)
+  // Start microphone recording
+  const startListening = useCallback(async () => {
+    setErrorMessage("");
+    if (isPlayingRef.current) {
+      stopPlayback();
+    }
+
+    // Stop existing recorder if any
+    stopListening();
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      streamRef.current = stream;
+      setupAudioAnalyser(stream);
+
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+        "audio/ogg;codecs=opus",
+        "audio/wav",
+      ];
+      const mimeType = candidates.find((c) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c)) || "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      isListeningActiveRef.current = true;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        stopAudioAnalyser();
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((t) => t.stop());
+          streamRef.current = null;
+        }
+
+        const blob = new Blob(chunksRef.current, { type: mimeType || "audio/wav" });
+        chunksRef.current = [];
+
+        if (blob.size === 0) {
+          if (isListeningActiveRef.current) {
+            setPhase("idle");
+          }
+          return;
+        }
+
+        setPhase("thinking");
+        try {
+          const b64 = await blobToBase64(blob);
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: "audio", b64, mime: blob.type }));
+            wsRef.current.send(JSON.stringify({ type: "stop" }));
+          } else {
+            setErrorMessage("Voice connection lost. Reconnecting...");
+            setPhase("idle");
+          }
+        } catch {
+          setPhase("idle");
+          setErrorMessage("Failed to process microphone audio.");
+        }
+      };
+
+      recorder.start(250);
+      setPhase("listening");
+      setUserTranscript("");
+      setAssistantText("");
+    } catch (err) {
+      setErrorMessage(
+        err.name === "NotAllowedError" || err.name === "PermissionDeniedError"
+          ? "Microphone access denied. Please grant microphone permission in your browser settings."
+          : `Microphone unavailable: ${err.message}`
+      );
+      setPhase("error");
+    }
+  }, [stopListening, stopPlayback]);
+
+  startListeningRef.current = startListening;
+
+  // Interrupt assistant mid-speech (barge-in)
+  const interrupt = useCallback(() => {
+    stopPlayback();
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "interrupt" }));
+    }
+    // Resume listening immediately after interrupt
+    startListening();
+  }, [stopPlayback, startListening]);
+
+  // Toggle Mute
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      isMutedRef.current = next;
+      if (next) {
+        // Muting stops listening and mutes playback
+        stopListening();
+        setPhase("muted");
+      } else {
+        // Unmuting resumes listening
+        startListening();
+      }
+      return next;
+    });
+  }, [stopListening, startListening]);
+
+  // WebSocket Connection Lifecycle
   const connectWebSocket = useCallback(() => {
     try {
       const wsUrl = getVoiceWebSocketUrl();
@@ -159,6 +324,10 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
           session_id: sessionIdRef.current || "default",
           persona: personaRef.current || "default",
         }));
+
+        if (autoStart) {
+          startListening();
+        }
       };
 
       ws.onmessage = (e) => {
@@ -166,12 +335,15 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
           const msg = JSON.parse(e.data);
           switch (msg.type) {
             case "ready":
-              setPhase((prev) => (prev === "speaking" ? prev : "idle"));
+              if (!isPlayingRef.current && phase !== "speaking") {
+                setPhase((prev) => (prev === "error" ? prev : "listening"));
+              }
               break;
             case "user_transcript":
               if (msg.text) {
                 setUserTranscript(msg.text);
                 setVoiceHistory((prev) => [...prev, { role: "user", content: msg.text }]);
+                // Commit to active conversation turns (PRD FR-08)
                 onAddMessageRef.current?.({ role: "user", content: msg.text, voiceMsg: true });
               }
               break;
@@ -189,23 +361,25 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
               if (msg.full) {
                 setAssistantText(msg.full);
                 setVoiceHistory((prev) => [...prev, { role: "assistant", content: msg.full }]);
+                // Commit to active conversation turns (PRD FR-08)
                 onAddMessageRef.current?.({ role: "assistant", content: msg.full, voiceMsg: true });
               }
               break;
             case "interrupted":
               stopPlayback();
-              setPhase("idle");
+              startListening();
               break;
             case "error":
-              setErrorMessage(msg.message || "Voice mode error");
-              setPhase("idle");
+              setErrorMessage(msg.message || "Voice mode encountered an error.");
+              setPhase("error");
               break;
           }
         } catch {}
       };
 
       ws.onerror = () => {
-        setErrorMessage("Voice connection error. Reconnecting or using audio fallback.");
+        setErrorMessage("Voice connection error. Reconnecting...");
+        setPhase("error");
       };
 
       ws.onclose = () => {
@@ -213,160 +387,36 @@ export function useVoiceSession({ userId, sessionId, persona = "default", onAddM
       };
     } catch (err) {
       setErrorMessage(err.message || "WebSocket connection failed");
+      setPhase("error");
     }
-  }, [enqueueAudio, stopPlayback]);
+  }, [autoStart, enqueueAudio, startListening, stopPlayback]);
 
-  // Initial connection & Intro voice (once on mount)
+  // Initialize on mount, clean up fully on unmount
   useEffect(() => {
     connectWebSocket();
 
-    let mounted = true;
-    fetchIntroAudioBlob(personaRef.current)
-      .then((blob) => {
-        if (!mounted || isMutedRef.current) return;
-        const url = URL.createObjectURL(blob);
-        const introAudio = new Audio(url);
-        currentAudioRef.current = introAudio;
-        isPlayingRef.current = true;
-        setPhase("speaking");
-
-        introAudio.onended = () => {
-          URL.revokeObjectURL(url);
-          isPlayingRef.current = false;
-          currentAudioRef.current = null;
-          if (mounted) setPhase("idle");
-        };
-        introAudio.onerror = () => {
-          URL.revokeObjectURL(url);
-          isPlayingRef.current = false;
-          currentAudioRef.current = null;
-          if (mounted) setPhase("idle");
-        };
-        introAudio.play().catch(() => {
-          isPlayingRef.current = false;
-          currentAudioRef.current = null;
-          if (mounted) setPhase("idle");
-        });
-      })
-      .catch(() => {
-        if (mounted) setPhase("idle");
-      });
-
     return () => {
-      mounted = false;
+      // 1. Stop audio playback
       stopPlayback();
+      // 2. Stop microphone tracks and recorder
+      stopListening();
+      // 3. Close audio analyser
       stopAudioAnalyser();
-      if (recorderRef.current && recorderRef.current.state !== "inactive") {
-        try { recorderRef.current.stop(); } catch {}
-      }
+      // 4. Send end and terminate WebSocket
       if (wsRef.current) {
-        try { wsRef.current.send(JSON.stringify({ type: "end" })); } catch {}
-        try { wsRef.current.close(); } catch {}
+        try {
+          wsRef.current.send(JSON.stringify({ type: "end" }));
+        } catch {}
+        try {
+          wsRef.current.close();
+        } catch {}
         wsRef.current = null;
       }
     };
-  }, [connectWebSocket, stopPlayback]);
-
-  // Start recording speech
-  const startListening = useCallback(async () => {
-    setErrorMessage("");
-    if (phase === "speaking") {
-      // Barge-in interrupt
-      interrupt();
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      setupAudioAnalyser(stream);
-
-      const candidates = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/mp4",
-        "audio/ogg;codecs=opus",
-        "audio/wav",
-      ];
-      const mimeType = candidates.find((c) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c)) || "";
-      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        stopAudioAnalyser();
-        stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(chunksRef.current, { type: mimeType || "audio/wav" });
-        chunksRef.current = [];
-
-        if (blob.size === 0) {
-          setPhase("idle");
-          return;
-        }
-
-        setPhase("thinking");
-        try {
-          const b64 = await blobToBase64(blob);
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: "audio", b64, mime: blob.type }));
-            wsRef.current.send(JSON.stringify({ type: "stop" }));
-          } else {
-            // Socket not connected, attempt reconnection
-            setErrorMessage("Voice socket disconnected. Reconnecting...");
-            connectWebSocket();
-            setPhase("idle");
-          }
-        } catch {
-          setPhase("idle");
-          setErrorMessage("Failed to process speech audio.");
-        }
-      };
-
-      recorder.start(250);
-      setPhase("listening");
-      setUserTranscript("");
-      setAssistantText("");
-    } catch (err) {
-      setErrorMessage(`Microphone access denied: ${err.message}`);
-      setPhase("idle");
-    }
-  }, [phase]);
-
-  // Stop recording speech
-  const stopListening = useCallback(() => {
-    if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      recorderRef.current.stop();
-      recorderRef.current = null;
-    }
-  }, []);
-
-  // Barge-in / Interrupt AI
-  const interrupt = useCallback(() => {
-    stopPlayback();
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "interrupt" }));
-    }
-    setPhase("idle");
-  }, [stopPlayback]);
-
-  // Toggle Mute
-  const toggleMute = useCallback(() => {
-    setIsMuted((prev) => {
-      const next = !prev;
-      isMutedRef.current = next;
-      if (currentAudioRef.current) {
-        currentAudioRef.current.muted = next;
-      }
-      return next;
-    });
-  }, []);
+  }, [connectWebSocket, stopListening, stopPlayback]);
 
   return {
-    phase,
+    phase: isMuted ? "muted" : phase,
     audioLevel,
     isMuted,
     userTranscript,

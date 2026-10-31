@@ -5,6 +5,8 @@ import {
   Database,
   PanelLeftClose,
   PanelLeftOpen,
+  Settings,
+  Volume2,
 } from "lucide-react";
 import ConversationSearch from "./ConversationSearch";
 import ConversationItem from "./ConversationItem";
@@ -24,6 +26,8 @@ export default function Sidebar({
   isOpen,
   onToggleSidebar,
   isMobile,
+  onOpenSettings,
+  selectedVoice = "default",
 }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [isFileLibraryOpen, setIsFileLibraryOpen] = useState(false);
@@ -140,6 +144,27 @@ export default function Sidebar({
           >
             <Database size={17} className="shrink-0 text-blue-400" />
             {isOpen && <span>Knowledge & Files</span>}
+          </button>
+        </div>
+
+        {/* Settings Action: Voice & Preferences (PRD Section 10) */}
+        <div className="sidebar-settings-section">
+          <button
+            className={`sidebar-settings-btn ${!isOpen ? "collapsed" : ""}`}
+            onClick={onOpenSettings}
+            title="Settings (Voice & Preferences)"
+            aria-label="Settings"
+          >
+            <Settings size={17} className="shrink-0 text-slate-400" />
+            {isOpen && (
+              <div className="sidebar-action-label-row">
+                <span>Settings</span>
+                <span className="sidebar-voice-pill">
+                  <Volume2 size={11} className="inline mr-1" />
+                  {selectedVoice.charAt(0).toUpperCase() + selectedVoice.slice(1)}
+                </span>
+              </div>
+            )}
           </button>
         </div>
 

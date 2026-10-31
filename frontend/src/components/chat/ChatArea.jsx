@@ -8,10 +8,13 @@ import {
   Image,
   Volume2,
   Film,
+  Settings,
 } from "lucide-react";
 import Message from "./Message";
 import Composer from "./Composer";
 import MemoryConsolidateModal from "./MemoryConsolidateModal";
+import CompactVoiceBar from "../voice/CompactVoiceBar";
+import { useVoiceSession } from "../../hooks/useVoiceSession";
 
 const CAPABILITIES = [
   { id: "docs", icon: <FileText size={15} className="text-blue-400" />, title: "Document", desc: "Upload PDFs, code or docs to ask questions" },
@@ -19,6 +22,57 @@ const CAPABILITIES = [
   { id: "voice", icon: <Volume2 size={15} className="text-purple-400" />, title: "Speech & Audio", desc: "Speak in real-time or upload audio recordings" },
   { id: "memory", icon: <Brain size={15} className="text-amber-400" />, title: "Persistent Memory", desc: "Consolidates knowledge across conversations" },
 ];
+
+/**
+ * CompactVoiceCompanion - Encapsulates active session-scoped voice lifecycle inside ChatArea.
+ */
+function CompactVoiceCompanion({
+  userId,
+  sessionId,
+  selectedVoice = "default",
+  onAddMessage,
+  onClose,
+}) {
+  const {
+    phase,
+    audioLevel,
+    isMuted,
+    userTranscript,
+    assistantText,
+    errorMessage,
+    startListening,
+    stopListening,
+    interrupt,
+    toggleMute,
+  } = useVoiceSession({
+    userId,
+    sessionId,
+    persona: selectedVoice,
+    autoStart: true,
+    onAddMessage,
+  });
+
+  return (
+    <CompactVoiceBar
+      phase={phase}
+      audioLevel={audioLevel}
+      isMuted={isMuted}
+      userTranscript={userTranscript}
+      assistantText={assistantText}
+      errorMessage={errorMessage}
+      personaLabel={
+        selectedVoice
+          ? selectedVoice.charAt(0).toUpperCase() + selectedVoice.slice(1)
+          : "Default"
+      }
+      onToggleMute={toggleMute}
+      onStartListening={startListening}
+      onStopListening={stopListening}
+      onInterrupt={interrupt}
+      onClose={onClose}
+    />
+  );
+}
 
 export default function ChatArea({
   session,
@@ -29,6 +83,11 @@ export default function ChatArea({
   isStreaming,
   onStopStreaming,
   onOpenVoiceMode,
+  isVoiceActive = false,
+  onCloseVoiceMode,
+  selectedVoice = "default",
+  onAddMessage,
+  onOpenSettings,
   onEditMessage,
   onRetryMessage,
   userId,
@@ -39,33 +98,40 @@ export default function ChatArea({
 }) {
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [isMemoryModalOpen, setIsMemoryModalOpen] = useState(false);
-  const messagesEndRef = useRef(null);
+
   const scrollContainerRef = useRef(null);
+  const messagesEndRef = useRef(null);
   const isUserScrollingRef = useRef(false);
 
-  // Auto-scroll logic
+  // Smooth scroll to bottom
   const scrollToBottom = (smooth = true) => {
-    messagesEndRef.current?.scrollIntoView({
+    if (!messagesEndRef.current) return;
+    messagesEndRef.current.scrollIntoView({
       behavior: smooth ? "smooth" : "auto",
+      block: "end",
     });
   };
 
+  // Auto-scroll when new messages arrive or when streaming
   useEffect(() => {
     if (!isUserScrollingRef.current) {
-      scrollToBottom(false);
+      scrollToBottom(!isStreaming);
     }
-  }, [messages, isStreaming]);
+  }, [messages, isStreaming, isVoiceActive]);
 
+  // Handle manual scroll to detect if user is browsing history
   const handleScroll = () => {
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    setShowScrollBtn(!isNearBottom);
+    if (!scrollContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
+    const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
+
+    const isNearBottom = distanceFromBottom < 100;
     isUserScrollingRef.current = !isNearBottom;
+    setShowScrollBtn(!isNearBottom);
   };
 
-  const handleStarterPrompt = (text) => {
-    onSendMessage({ text });
+  const handleStarterPrompt = (promptText) => {
+    onSendMessage({ text: promptText });
   };
 
   return (
@@ -97,6 +163,17 @@ export default function ChatArea({
             <Brain size={14} className="text-purple-400" />
             <span className="hidden sm:inline">Update Memory</span>
           </button>
+
+          {onOpenSettings && (
+            <button
+              onClick={onOpenSettings}
+              className="chat-settings-action-btn"
+              title="Settings & Voice Preferences"
+              aria-label="Settings"
+            >
+              <Settings size={15} className="text-slate-300" />
+            </button>
+          )}
         </div>
       </header>
 
@@ -124,7 +201,13 @@ export default function ChatArea({
                 {CAPABILITIES.map((cap) => (
                   <div
                     key={cap.id}
-                    onClick={() => handleStarterPrompt(`Tell me more about ${cap.title.toLowerCase()}`)}
+                    onClick={() => {
+                      if (cap.id === "voice") {
+                        onOpenVoiceMode?.();
+                      } else {
+                        handleStarterPrompt(`Tell me more about ${cap.title.toLowerCase()}`);
+                      }
+                    }}
                     className="capability-card"
                     role="button"
                     tabIndex={0}
@@ -166,6 +249,20 @@ export default function ChatArea({
         >
           <ArrowDown size={16} />
         </button>
+      )}
+
+      {/* In-Chat Compact Voice Mode (PRD Section 6.1, UI-01, UI-02, UI-08) */}
+      {isVoiceActive && (
+        <div className="chat-compact-voice-container">
+          <CompactVoiceCompanion
+            key={`voice-${session?.id}`}
+            userId={userId}
+            sessionId={session?.id}
+            selectedVoice={selectedVoice}
+            onAddMessage={onAddMessage}
+            onClose={onCloseVoiceMode}
+          />
+        </div>
       )}
 
       {/* Anchored Composer Input Bar */}

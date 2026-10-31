@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { v4 as uuidv4 } from "uuid";
 import Sidebar from "./components/sidebar/Sidebar";
 import ChatArea from "./components/chat/ChatArea";
-import VoiceOverlay from "./components/voice/VoiceOverlay";
+import SettingsModal from "./components/settings/SettingsModal";
 import AuthModal from "./components/auth/AuthModal";
 import HealthBanner from "./components/common/HealthBanner";
 import ToastContainer, { showToast } from "./components/common/Toast";
@@ -12,6 +12,8 @@ import { useChatStream } from "./hooks/useChatStream";
 import { useHealth } from "./hooks/useHealth";
 import { sendImageChat, sendVideoChat, sendAudioChat } from "./api/chat";
 import { uploadDocument } from "./api/files";
+
+const VOICE_PREF_KEY = "cortex_voice_preference";
 
 export default function App() {
   const {
@@ -43,8 +45,21 @@ export default function App() {
   const isOnline = useHealth(25000);
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isVoiceOverlayOpen, setIsVoiceOverlayOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+
+  // Compact Voice Mode state (PRD Section 1.0 & 7.2)
+  const [isVoiceActive, setIsVoiceActive] = useState(false);
+  const [activeVoiceSessionId, setActiveVoiceSessionId] = useState(null);
+
+  // Settings & Voice Preferences (PRD Section 10)
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState(() => {
+    try {
+      return localStorage.getItem(VOICE_PREF_KEY) || "default";
+    } catch {
+      return "default";
+    }
+  });
 
   // Per-session drafts: { [sessionId]: { text: string, attachments: Array } }
   const [sessionDrafts, setSessionDrafts] = useState({});
@@ -100,186 +115,182 @@ export default function App() {
         setIsSidebarOpen((prev) => !prev);
       } else if (isMod && e.shiftKey && e.key.toLowerCase() === "o") {
         e.preventDefault();
-        createNewChat();
+        handleNewChat();
+      } else if (isMod && e.key === ",") {
+        e.preventDefault();
+        setIsSettingsOpen(true);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [createNewChat]);
+  }, []);
 
-  // Handle Text and Multi-Attachment Message Sending
+  // Voice Mode Start & Stop Handlers
+  const handleOpenVoiceMode = useCallback(() => {
+    setIsVoiceActive(true);
+    setActiveVoiceSessionId(activeSessionId);
+  }, [activeSessionId]);
+
+  const handleCloseVoiceMode = useCallback(() => {
+    setIsVoiceActive(false);
+    setActiveVoiceSessionId(null);
+  }, []);
+
+  // Switching chats safely ends active voice session (PRD FR-07 & Section 7.2)
+  const handleSelectSession = useCallback((id) => {
+    if (isVoiceActive) {
+      setIsVoiceActive(false);
+      setActiveVoiceSessionId(null);
+    }
+    setActiveSessionId(id);
+    if (isMobile) setIsSidebarOpen(false);
+  }, [isVoiceActive, isMobile, setActiveSessionId]);
+
+  const handleNewChat = useCallback(() => {
+    if (isVoiceActive) {
+      setIsVoiceActive(false);
+      setActiveVoiceSessionId(null);
+    }
+    createNewChat();
+    if (isMobile) setIsSidebarOpen(false);
+  }, [isVoiceActive, isMobile, createNewChat]);
+
+  // Central Send Message Handler
   const handleSendMessage = useCallback(
-    async ({ text, attachments = [], attachment }) => {
+    async ({ text, attachments = [] }) => {
       if (isStreaming) return;
-      const sessionId = activeSessionId;
 
-      // Normalise attachments into an array
-      const rawList = Array.isArray(attachments) && attachments.length > 0
-        ? attachments
-        : attachment
-        ? [attachment]
-        : [];
+      const trimmedText = text?.trim() || "";
+      const validAttachments = Array.isArray(attachments) ? attachments : [];
 
-      let userText = text ? text.trim() : "";
+      if (!trimmedText && validAttachments.length === 0) return;
 
-      // Construct message-level attachments array
-      const msgAttachments = rawList.map((att) => ({
-        type: att.type,
-        name: att.file?.name || (att.type === "audio" ? "recording.wav" : "attachment"),
-        url: att.previewUrl || null,
-      }));
+      let targetSessionId = activeSessionId;
+      if (!targetSessionId) {
+        targetSessionId = createNewChat();
+      }
 
-      // Default prompt text if user provided none
-      if (!userText && rawList.length > 0) {
-        const names = rawList.map((a) => a.file?.name).filter(Boolean).join(", ");
-        const firstType = rawList[0].type;
-        if (rawList.length === 1) {
-          userText =
-            firstType === "image"
-              ? "What can you tell me about this image?"
-              : firstType === "audio"
-              ? "Please respond to my voice recording."
-              : firstType === "video"
-              ? "What is happening in this video?"
-              : `I've uploaded a file: ${rawList[0].file?.name || "document"}`;
-        } else {
-          userText = `I've uploaded ${rawList.length} files (${names || "documents & media"}). Please analyze them.`;
+      // Clear draft for this session
+      setSessionDrafts((prev) => {
+        const next = { ...prev };
+        delete next[targetSessionId];
+        delete next["draft-new"];
+        return next;
+      });
+
+      // 1. Process attachments
+      const attachedImages = validAttachments.filter((a) => a.type === "image");
+      const attachedVideos = validAttachments.filter((a) => a.type === "video");
+      const attachedAudios = validAttachments.filter((a) => a.type === "audio");
+      const attachedFiles = validAttachments.filter((a) => a.type === "file");
+
+      // Upload files for RAG if needed
+      for (const item of attachedFiles) {
+        try {
+          await uploadDocument({
+            userId: currentUser?.id || "user_default",
+            file: item.file,
+          });
+        } catch {
+          // File may already have been uploaded in the background
         }
       }
 
-      // Add user turn
+      // 2. Optimistic User Message
+      const userMsgId = uuidv4();
       const userMsg = {
-        id: uuidv4(),
+        id: userMsgId,
         role: "user",
-        content: userText,
+        content: trimmedText,
+        attachments: validAttachments.map((a) => ({
+          type: a.type,
+          name: a.file?.name,
+          previewUrl: a.previewUrl,
+        })),
         ts: Date.now(),
-        attachments: msgAttachments,
-        // Legacy fallback fields for backward compatibility
-        ...(rawList.length === 1 ? {
-          mediaType: rawList[0].type,
-          mediaName: rawList[0].file?.name || "attachment",
-          mediaUrl: rawList[0].previewUrl,
-        } : {}),
       };
-      addMessage(sessionId, userMsg);
+      addMessage(targetSessionId, userMsg);
 
-      // Clear draft for this session
-      setSessionDrafts((prev) => ({
-        ...prev,
-        [currentDraftKey]: { text: "", attachments: [] },
-      }));
-
-      // Create placeholder AI message
-      const aiMsgId = uuidv4();
-      addMessage(sessionId, {
-        id: aiMsgId,
+      // 3. Create Placeholder Assistant Message
+      const assistantMsgId = uuidv4();
+      const assistantMsg = {
+        id: assistantMsgId,
         role: "assistant",
         content: "",
-        isStreaming: true,
         ts: Date.now(),
-      });
+      };
+      addMessage(targetSessionId, assistantMsg);
 
+      // 4. Branch by Special Attachment Types
       try {
-        const docFiles = rawList.filter((a) => a.type === "file");
-        const imageFiles = rawList.filter((a) => a.type === "image");
-        const videoFiles = rawList.filter((a) => a.type === "video");
-        const audioFiles = rawList.filter((a) => a.type === "audio");
-
-        // 1. Ensure any document files are indexed (composer indexes them inline)
-        const unindexedDocs = docFiles.filter((a) => a.status !== "ready");
-        if (unindexedDocs.length > 0) {
-          for (let i = 0; i < unindexedDocs.length; i++) {
-            const doc = unindexedDocs[i];
-            await uploadDocument({ userId: currentUser.id, file: doc.file });
-          }
+        if (attachedImages.length > 0) {
+          const resp = await sendImageChat({
+            userId: currentUser?.id || "user_default",
+            sessionId: targetSessionId,
+            message: trimmedText || "Analyze this image in detail.",
+            imageFile: attachedImages[0].file,
+          });
+          updateMessage(targetSessionId, assistantMsgId, resp.response || "No response generated.");
+          return;
         }
 
-        // 2. Handle Multimodal Chat execution
-        // Case A: Single Image without videos/audios
-        if (imageFiles.length === 1 && videoFiles.length === 0 && audioFiles.length === 0 && docFiles.length === 0) {
-          const res = await sendImageChat({
-            userId: currentUser.id,
-            sessionId,
-            message: userText || "Describe this image.",
-            imageFile: imageFiles[0].file,
+        if (attachedVideos.length > 0) {
+          const resp = await sendVideoChat({
+            userId: currentUser?.id || "user_default",
+            sessionId: targetSessionId,
+            message: trimmedText || "Analyze this video in detail.",
+            videoFile: attachedVideos[0].file,
           });
-          updateMessage(sessionId, aiMsgId, { content: res.reply, isStreaming: false });
+          updateMessage(targetSessionId, assistantMsgId, resp.response || "No response generated.");
+          return;
         }
-        // Case B: Single Video
-        else if (videoFiles.length === 1 && imageFiles.length === 0 && audioFiles.length === 0 && docFiles.length === 0) {
-          const res = await sendVideoChat({
-            userId: currentUser.id,
-            sessionId,
-            message: userText || "What is happening in this video?",
-            videoFile: videoFiles[0].file,
-          });
-          updateMessage(sessionId, aiMsgId, { content: res.reply, isStreaming: false });
-        }
-        // Case C: Single Audio
-        else if (audioFiles.length === 1 && imageFiles.length === 0 && videoFiles.length === 0 && docFiles.length === 0) {
-          const audioItem = audioFiles[0];
-          let audioExt = "webm";
-          const mime = audioItem.file?.type || "";
-          if (mime.includes("wav")) audioExt = "wav";
-          else if (mime.includes("mp4")) audioExt = "mp4";
-          else if (mime.includes("ogg")) audioExt = "ogg";
-          else if (mime.includes("mpeg") || mime.includes("mp3")) audioExt = "mp3";
 
-          const fileName = audioItem.file?.name || `recording.${audioExt}`;
-          const res = await sendAudioChat({
-            userId: currentUser.id,
-            sessionId,
-            message: userText || "",
-            audioFile: audioItem.file,
-            filename: fileName,
+        if (attachedAudios.length > 0) {
+          const resp = await sendAudioChat({
+            userId: currentUser?.id || "user_default",
+            sessionId: targetSessionId,
+            audioFile: attachedAudios[0].file,
           });
-          if (res.transcript) {
-            updateMessage(sessionId, userMsg.id, {
-              content: `🎙️ ${res.transcript}${userText ? `\n\n${userText}` : ""}`,
-            });
-          }
-          updateMessage(sessionId, aiMsgId, { content: res.reply, isStreaming: false });
+          updateMessage(
+            targetSessionId,
+            assistantMsgId,
+            resp.response || "Audio transcribed and processed successfully."
+          );
+          return;
         }
-        // Case D: Multiple images/media or documents uploaded -> use RAG-enabled Streaming Chat
-        else {
-          let enrichedPrompt = userText;
-          if (rawList.length > 0) {
-            const attachedSummary = rawList.map((a) => `- [${a.type}] ${a.file?.name || "file"}`).join("\n");
-            enrichedPrompt = `${userText}\n\n[User attached the following ${rawList.length} items in this turn:\n${attachedSummary}]`;
-          }
 
-          await startStream({
-            userId: currentUser.id,
-            sessionId,
-            message: enrichedPrompt,
-            onToken: (token) => appendToMessage(sessionId, aiMsgId, token),
-            onDone: (fullText) => {
-              updateMessage(sessionId, aiMsgId, { content: fullText, isStreaming: false });
-            },
-            onError: (err) => {
-              updateMessage(sessionId, aiMsgId, {
-                content: `[error] Streaming failed: ${err}`,
-                isStreaming: false,
-                isError: true,
-              });
-              showToast(err, "error");
-            },
-          });
-        }
-      } catch (err) {
-        updateMessage(sessionId, aiMsgId, {
-          content: `[error] ${err.message || "An unexpected error occurred."}`,
-          isStreaming: false,
-          isError: true,
+        // 5. Standard Streaming Text / RAG Chat
+        await startStream({
+          userId: currentUser?.id || "user_default",
+          sessionId: targetSessionId,
+          message: trimmedText,
+          onDelta: (deltaText) => {
+            appendToMessage(targetSessionId, assistantMsgId, deltaText);
+          },
+          onDone: (fullText) => {
+            updateMessage(targetSessionId, assistantMsgId, fullText);
+          },
+          onError: (err) => {
+            updateMessage(
+              targetSessionId,
+              assistantMsgId,
+              `⚠️ Error: ${err.message || "Failed to generate response. Please check your network and API keys."}`
+            );
+          },
         });
-        showToast(err.message || "Request failed", "error");
+      } catch (err) {
+        updateMessage(
+          targetSessionId,
+          assistantMsgId,
+          `⚠️ Error: ${err.message || "Failed to send message. Please try again."}`
+        );
       }
     },
     [
       isStreaming,
       activeSessionId,
-      currentUser.id,
-      currentDraftKey,
+      createNewChat,
+      currentUser,
       addMessage,
       updateMessage,
       appendToMessage,
@@ -287,13 +298,11 @@ export default function App() {
     ]
   );
 
-  // Handle Editing User Message & Branching
+  // Handle Editing Previous Message
   const handleEditMessage = useCallback(
-    async (messageId, newContent) => {
+    (msgId, newContent) => {
       if (isStreaming) return;
-      truncateMessagesFrom(activeSessionId, messageId);
-
-      // Send the edited turn
+      truncateMessagesFrom(activeSessionId, msgId);
       handleSendMessage({ text: newContent });
     },
     [activeSessionId, isStreaming, truncateMessagesFrom, handleSendMessage]
@@ -312,7 +321,7 @@ export default function App() {
     [activeSessionId, isStreaming, messages, truncateMessagesFrom, handleSendMessage]
   );
 
-  // Handle messages added from Voice Overlay
+  // Handle messages added from Voice Mode (commits turns to active chat history)
   const handleVoiceAddMessage = useCallback(
     (msgData) => {
       addMessage(activeSessionId, {
@@ -332,14 +341,8 @@ export default function App() {
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
-        onSelectSession={(id) => {
-          setActiveSessionId(id);
-          if (isMobile) setIsSidebarOpen(false);
-        }}
-        onNewChat={() => {
-          createNewChat();
-          if (isMobile) setIsSidebarOpen(false);
-        }}
+        onSelectSession={handleSelectSession}
+        onNewChat={handleNewChat}
         onDeleteSession={deleteSession}
         onRenameSession={renameSession}
         currentUser={currentUser}
@@ -348,6 +351,8 @@ export default function App() {
         isOpen={isSidebarOpen}
         onToggleSidebar={() => setIsSidebarOpen((prev) => !prev)}
         isMobile={isMobile}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        selectedVoice={selectedVoice}
       />
 
       {/* Main Workspace Area */}
@@ -362,7 +367,12 @@ export default function App() {
           onSendMessage={handleSendMessage}
           isStreaming={isStreaming}
           onStopStreaming={stopStream}
-          onOpenVoiceMode={() => setIsVoiceOverlayOpen(true)}
+          onOpenVoiceMode={handleOpenVoiceMode}
+          isVoiceActive={isVoiceActive && activeVoiceSessionId === activeSessionId}
+          onCloseVoiceMode={handleCloseVoiceMode}
+          selectedVoice={selectedVoice}
+          onAddMessage={handleVoiceAddMessage}
+          onOpenSettings={() => setIsSettingsOpen(true)}
           onEditMessage={handleEditMessage}
           onRetryMessage={handleRetryMessage}
           userId={currentUser?.id}
@@ -373,16 +383,13 @@ export default function App() {
         />
       </main>
 
-      {/* Fullscreen ChatGPT-Style Voice Mode Overlay */}
-      {isVoiceOverlayOpen && (
-        <VoiceOverlay
-          isOpen={isVoiceOverlayOpen}
-          onClose={() => setIsVoiceOverlayOpen(false)}
-          userId={currentUser?.id}
-          sessionId={activeSessionId}
-          onAddMessage={handleVoiceAddMessage}
-        />
-      )}
+      {/* Settings & Voice Preferences Modal (PRD Section 10) */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        selectedVoice={selectedVoice}
+        onVoiceChange={setSelectedVoice}
+      />
 
       {/* Authentication Modal */}
       <AuthModal
