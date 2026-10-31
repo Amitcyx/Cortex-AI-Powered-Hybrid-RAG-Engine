@@ -1,0 +1,52 @@
+# -- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -- Frontend ----------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+.eslintcache
+
+# -- Testing & Coverage ------------------------------------------------
+coverage/
+.coverage
+htmlcov/
+
+# -- Editors / OS ------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# -- Secrets & local config --------------------------------------------
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# -- Project runtime data ----------------------------------------------
+uploads/*
+!uploads/.gitkeep
+db/*.db
+db/*.sqlite
+chroma_db/
+*.log

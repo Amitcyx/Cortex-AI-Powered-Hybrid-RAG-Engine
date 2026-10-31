@@ -1,0 +1,15 @@
+{
+  "name": "cortex-ai-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cortex: AI-Powered Hybrid RAG Engine",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview",
+    "install:frontend": "npm --prefix frontend install"
+  },
+  "keywords": ["ai", "cortex", "voice", "rag"],
+  "author": "Amit Pol",
+  "license": "MIT"
+}
