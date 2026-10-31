@@ -717,7 +717,13 @@ async def voice_stream(ws: WebSocket):
                     continue
                 await _ws_send(ws, {"type": "user_transcript", "text": transcript})
                 state["turn_in_flight"] = True
-                await _run_voice_turn(ws, state, transcript)
+                try:
+                    await _run_voice_turn(ws, state, transcript)
+                except Exception as turn_err:
+                    print(f"[voice/stream] turn error: {turn_err}")
+                    await _ws_send(ws, {"type": "error", "message": f"Turn error: {turn_err}"})
+                finally:
+                    state["turn_in_flight"] = False
 
             elif kind == "interrupt":
                 if state.get("cancel_token"):
